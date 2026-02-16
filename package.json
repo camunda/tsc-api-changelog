@@ -1,0 +1,23 @@
+{
+  "name": "@camunda8/tsc-api-changelog",
+  "version": "0.1.0",
+  "description": "TypeScript structural type compatibility checker for SDK API surfaces",
+  "type": "module",
+  "bin": {
+    "tsc-api-changelog": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "tsx": "^4.19.4",
+    "@types/node": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "private": true
+}
