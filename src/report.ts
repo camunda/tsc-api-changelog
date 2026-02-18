@@ -6,6 +6,8 @@ import { classifyRole } from './roles.js';
 import type { CompatError, CompatResult } from './check.js';
 import { summarizeError } from './summarize.js';
 
+export type ReportMode = 'migration' | 'regression';
+
 export interface ReportMetadata {
   stableRef: string;
   stableSha: string;
@@ -414,10 +416,53 @@ export function countBreaking(result: CompatResult): number {
   return breakingTypes.size;
 }
 
+const REGRESSION_CATEGORIES = new Set([
+  'enum-member-removed',
+  'became-optional',
+  'became-required',
+  'null-removed',
+  'widened-to-unknown',
+  'type-changed',
+]);
+
+/**
+ * Filter a CompatResult to only include regression-disallowed changes:
+ * removed enum members, missing types, type widening, property type changes,
+ * missing properties, optional→required request fields, required→optional response fields.
+ */
+export function filterForRegression(result: CompatResult): CompatResult {
+  const filteredErrors = result.errors.filter((err) => {
+    if (err.code === 'TS2724') return true; // removed type
+    const summary = summarizeError(err);
+    if (!summary) return true; // unknown = potentially disallowed
+    return REGRESSION_CATEGORIES.has(summary.category);
+  });
+
+  const incompatibleTypes = [
+    ...new Set(
+      filteredErrors
+        .filter((e) => e.code !== 'TS2724')
+        .map((e) => e.typeName)
+    ),
+  ];
+
+  return {
+    errors: filteredErrors,
+    stableCount: result.stableCount,
+    currentCount: result.currentCount,
+    addedTypes: [],
+    removedTypes: result.removedTypes,
+    incompatibleTypes,
+    additiveChanges: [],
+    removedProperties: result.removedProperties,
+  };
+}
+
 export function generateReport(
   stableVersion: string,
   currentVersion: string,
   result: CompatResult,
+  mode: ReportMode = 'migration',
   metadata?: ReportMetadata
 ): string {
   const lines: string[] = [];
@@ -425,9 +470,15 @@ export function generateReport(
   // Extract major.minor from stable version
   const stableMajorMinor = stableVersion.replace(/^(\d+\.\d+).*$/, '$1');
 
-  lines.push(
-    `# Migrating from ${stableMajorMinor} to ${currentVersion}`
-  );
+  if (mode === 'regression') {
+    lines.push(
+      `# API Regression Report: ${stableMajorMinor} → ${currentVersion}`
+    );
+  } else {
+    lines.push(
+      `# Migrating from ${stableMajorMinor} to ${currentVersion}`
+    );
+  }
   lines.push('');
 
   // Metadata in HTML comment
@@ -589,4 +640,115 @@ export function generateReport(
   lines.push('');
 
   return lines.join('\n');
+}
+
+/**
+ * Generate a JSON report with deterministic ordering for git-diffable output.
+ * All object keys are alphabetically ordered and all arrays are sorted.
+ */
+export function generateJsonReport(
+  stableVersion: string,
+  currentVersion: string,
+  result: CompatResult,
+  mode: ReportMode = 'migration',
+  metadata?: ReportMetadata
+): string {
+  const changes: Array<{
+    category: string;
+    changeType: string;
+    description: string;
+    operation: string | null;
+    propertyPath: string | null;
+    role: string;
+    typeName: string;
+  }> = [];
+
+  // Process type errors
+  for (const err of result.errors) {
+    if (err.code === 'TS2724') continue; // handled via removedTypes
+    const summary = summarizeError(err);
+    const breaking = isBreakingError(err);
+    const annotation = annotationForError(err);
+    changes.push({
+      category: categorize(breaking, annotation),
+      changeType: summary?.category ?? 'unknown',
+      description: formatError(err),
+      operation: extractOperation(err.typeName)?.[0] ?? null,
+      propertyPath: summary?.propertyPath ?? null,
+      role: classifyRole(err.typeName),
+      typeName: err.typeName,
+    });
+  }
+
+  // Process additive changes
+  for (const change of result.additiveChanges) {
+    const typeStr = change.propertyType ? `: ${change.propertyType}` : '';
+    changes.push({
+      category: 'additive',
+      changeType: 'added-property',
+      description: `Added property ${change.property}${typeStr}`,
+      operation: extractOperation(change.typeName)?.[0] ?? null,
+      propertyPath: `.${change.property}`,
+      role: classifyRole(change.typeName),
+      typeName: change.typeName,
+    });
+  }
+
+  // Process removed properties
+  for (const change of result.removedProperties) {
+    const typeStr = change.propertyType ? `: ${change.propertyType}` : '';
+    changes.push({
+      category: 'breaking',
+      changeType: 'removed-property',
+      description: `Removed property ${change.property}${typeStr}`,
+      operation: extractOperation(change.typeName)?.[0] ?? null,
+      propertyPath: `.${change.property}`,
+      role: classifyRole(change.typeName),
+      typeName: change.typeName,
+    });
+  }
+
+  // Sort deterministically: category → typeName → description
+  const categoryOrder: Record<string, number> = {
+    breaking: 0,
+    exhaustiveness: 1,
+    additive: 2,
+  };
+  changes.sort((a, b) => {
+    const ca = categoryOrder[a.category] ?? 99;
+    const cb = categoryOrder[b.category] ?? 99;
+    if (ca !== cb) return ca - cb;
+    if (a.typeName !== b.typeName)
+      return a.typeName.localeCompare(b.typeName);
+    return a.description.localeCompare(b.description);
+  });
+
+  // Build report with alphabetically ordered keys for deterministic output
+  const report = {
+    changes,
+    metadata: {
+      currentRef: metadata?.currentRef ?? '',
+      currentSha: metadata?.currentSha ?? '',
+      currentVersion,
+      mode,
+      repoPath: metadata?.repoPath ?? '',
+      stableRef: metadata?.stableRef ?? '',
+      stableSha: metadata?.stableSha ?? '',
+      stableVersion,
+    },
+    newTypes: [...result.addedTypes].sort(),
+    removedTypes: [...result.removedTypes].sort(),
+    summary: {
+      addedTypeCount: result.addedTypes.length,
+      additivePropertyChangeCount: result.additiveChanges.length,
+      breakingChangeCount: countBreaking(result),
+      currentTypeCount: result.currentCount,
+      incompatibleTypeCount: result.incompatibleTypes.length,
+      removedPropertyCount: result.removedProperties.length,
+      removedTypeCount: result.removedTypes.length,
+      stableTypeCount: result.stableCount,
+    },
+  };
+
+  return JSON.stringify(report, null, 2) + '\n';
 }
