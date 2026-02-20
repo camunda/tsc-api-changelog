@@ -108,6 +108,7 @@ Required:
   --repo <path>        Path to the git repository
   --old <ref>          Git ref for the stable/baseline version (tag, branch, SHA)
   --new <ref>          Git ref for the current/next version (tag, branch, SHA)
+                       Use "WORKTREE" to read from the working directory
 
 Options:
   --types-file <path>  Path to the types file within the repo

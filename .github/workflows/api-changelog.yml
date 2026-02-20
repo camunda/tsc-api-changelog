@@ -1,0 +1,78 @@
+name: API Changelog
+
+on:
+  workflow_dispatch:
+    inputs:
+      camunda_branch:
+        description: 'Branch of camunda/camunda to generate the SDK from'
+        required: true
+        type: string
+
+jobs:
+  api-changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tsc-api-changelog
+        uses: actions/checkout@v4
+
+      - name: Checkout orchestration-cluster-api-js
+        uses: actions/checkout@v4
+        with:
+          repository: camunda/orchestration-cluster-api-js
+          path: orchestration-cluster-api-js
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install SDK dependencies
+        working-directory: orchestration-cluster-api-js
+        run: npm ci
+
+      - name: Generate SDK from branch
+        working-directory: orchestration-cluster-api-js
+        run: SPEC_REF=${{ inputs.camunda_branch }} npm run generate
+
+      - name: Install tsc-api-changelog dependencies
+        run: npm ci
+
+      - name: Build tsc-api-changelog
+        run: npm run build
+
+      - name: Generate timestamp
+        id: timestamp
+        run: echo "ts=$(date -u '+%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"
+
+      - name: Sanitize branch name for filename
+        id: branch
+        run: |
+          SAFE_BRANCH=$(echo "${{ inputs.camunda_branch }}" | sed 's/[^a-zA-Z0-9._-]/_/g')
+          echo "safe=$SAFE_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Generate Markdown report
+        run: |
+          node dist/cli.js \
+            --repo orchestration-cluster-api-js \
+            --old stable/8.8 \
+            --new WORKTREE \
+            --format markdown \
+            --output "reports/${{ steps.timestamp.outputs.ts }}_${{ steps.branch.outputs.safe }}.md"
+        continue-on-error: true
+
+      - name: Generate JSON report
+        run: |
+          node dist/cli.js \
+            --repo orchestration-cluster-api-js \
+            --old stable/8.8 \
+            --new WORKTREE \
+            --format json \
+            --output "reports/${{ steps.timestamp.outputs.ts }}_${{ steps.branch.outputs.safe }}.json"
+        continue-on-error: true
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-changelog-${{ steps.timestamp.outputs.ts }}_${{ steps.branch.outputs.safe }}
+          path: reports/

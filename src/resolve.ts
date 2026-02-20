@@ -23,9 +23,9 @@ export interface ResolvedTypes {
  * Extract the types file and version from a git ref.
  *
  * @param repoPath - Absolute path to a git repository
- * @param ref - Git ref (tag, branch, SHA)
- * @param typesFile - Path to the types file within the repo (default: src/gen/types.gen.ts)
+ * @param ref - Git ref (tag, branch, SHA), or "WORKTREE" to read from the working directory
  * @param outDir - Directory to write the extracted file into
+ * @param typesFile - Path to the types file within the repo (default: src/gen/types.gen.ts)
  */
 export function resolveTypesFromRef(
   repoPath: string,
@@ -33,6 +33,43 @@ export function resolveTypesFromRef(
   outDir: string,
   typesFile = 'src/gen/types.gen.ts'
 ): ResolvedTypes {
+  // Special ref: read directly from the working directory (uncommitted files)
+  if (ref === 'WORKTREE') {
+    const filePath = path.join(repoPath, typesFile);
+    if (!fs.existsSync(filePath)) {
+      throw new Error(
+        `Cannot read ${typesFile} from working tree in ${repoPath}.\n` +
+          `Make sure the file exists on disk.`
+      );
+    }
+
+    const content = fs.readFileSync(filePath, 'utf-8');
+
+    let version = 'WORKTREE';
+    try {
+      const pkgPath = path.join(repoPath, 'package.json');
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+      version = pkg.version || 'WORKTREE';
+    } catch {
+      // Non-fatal
+    }
+
+    let sha = 'WORKTREE';
+    try {
+      sha = execSync('git rev-parse HEAD', {
+        cwd: repoPath,
+        encoding: 'utf-8',
+      }).trim();
+    } catch {
+      // Non-fatal — repo may not have commits
+    }
+
+    const outPath = path.join(outDir, 'types-WORKTREE.ts');
+    fs.writeFileSync(outPath, content);
+
+    return { path: outPath, ref, sha, version };
+  }
+
   // Resolve the ref to a SHA
   const sha = execSync(`git rev-parse "${ref}"`, {
     cwd: repoPath,
