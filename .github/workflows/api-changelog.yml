@@ -27,6 +27,10 @@ jobs:
         with:
           node-version: '24'
 
+      - name: Create local stable/8.8 branch
+        working-directory: orchestration-cluster-api-js
+        run: git branch stable/8.8 origin/stable/8.8
+
       - name: Install SDK dependencies
         working-directory: orchestration-cluster-api-js
         run: npm ci
