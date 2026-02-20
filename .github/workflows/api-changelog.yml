@@ -62,8 +62,8 @@ jobs:
             --old stable/8.8 \
             --new WORKTREE \
             --format markdown \
-            --output "reports/${{ steps.timestamp.outputs.ts }}_${{ steps.branch.outputs.safe }}.md"
-        continue-on-error: true
+            --output "reports/${{ steps.timestamp.outputs.ts }}_${{ steps.branch.outputs.safe }}.md" \
+            || true
 
       - name: Generate JSON report
         run: |
@@ -72,8 +72,8 @@ jobs:
             --old stable/8.8 \
             --new WORKTREE \
             --format json \
-            --output "reports/${{ steps.timestamp.outputs.ts }}_${{ steps.branch.outputs.safe }}.json"
-        continue-on-error: true
+            --output "reports/${{ steps.timestamp.outputs.ts }}_${{ steps.branch.outputs.safe }}.json" \
+            || true
 
       - name: Upload reports
         uses: actions/upload-artifact@v4
