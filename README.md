@@ -64,35 +64,41 @@ The report groups changes by API operation (e.g. `GetDecisionInstance` groups `G
 ## Usage
 
 ```bash
-npx tsx src/cli.ts <repo-path> <stable-ref> <current-ref> [options]
+npx tsx src/cli.ts --repo <path> --old <ref> --new <ref> [options]
 ```
 
-### Arguments
+### Required options
 
-| Argument | Description |
+| Option | Description |
 |---|---|
-| `repo-path` | Path to the git repository |
-| `stable-ref` | Git ref for the baseline version (tag, branch, SHA) |
-| `current-ref` | Git ref for the current version |
+| `--repo <path>` | Path to the git repository |
+| `--old <ref>` | Git ref for the stable/baseline version (tag, branch, SHA) |
+| `--new <ref>` | Git ref for the current version. Use `WORKTREE` to read from the working directory. |
 
 ### Options
 
 | Option | Default | Description |
 |---|---|---|
 | `--types-file <path>` | `src/gen/types.gen.ts` | Path to the types file within the repo |
-| `--out-dir <path>` | `<repo-path>/changes` | Directory for the output report |
+| `--output <path>` | stdout | Output file path for the report |
+| `--mode <mode>` | `migration` | `migration` (all changes) or `regression` (disallowed breaking changes only) |
+| `--format <format>` | `markdown` | `markdown` or `json` |
 
 ### Examples
 
 ```bash
 # Compare stable branch to main
-npx tsx src/cli.ts ./orchestration-cluster-api-js stable/8.8 main
+npx tsx src/cli.ts --repo ./orchestration-cluster-api-js --old stable/8.8 --new main
 
-# Custom types file location
-npx tsx src/cli.ts /path/to/repo v1.0.0 v2.0.0 --types-file src/types.ts
+# Compare against working directory (after regenerating from a different spec)
+npx tsx src/cli.ts --repo ./orchestration-cluster-api-js --old stable/8.8 --new WORKTREE \
+  --output reports/8.8-to-8.9.md
 
-# Write report to a specific directory
-npx tsx src/cli.ts ./my-sdk stable/1.0 main --out-dir ./reports
+# Regression check (only disallowed breaking changes)
+npx tsx src/cli.ts --repo ./my-sdk --old v1.0.0 --new v2.0.0 --mode regression
+
+# JSON output
+npx tsx src/cli.ts --repo ./my-sdk --old v1.0.0 --new v2.0.0 --format json
 ```
 
 ### Exit codes
