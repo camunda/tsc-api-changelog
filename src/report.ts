@@ -51,7 +51,7 @@ const SUFFIX_ROLE: Record<string, 'Request' | 'Response'> = {
   Errors: 'Response',
 };
 
-type ChangeCategory = 'breaking' | 'exhaustiveness' | 'additive';
+type ChangeCategory = 'api-breaking' | 'sdk-breaking' | 'hardened' | 'exhaustiveness' | 'additive';
 
 interface ChangeItem {
   text: string;
@@ -77,24 +77,51 @@ interface SchemaGroup {
   items: ChangeItem[];
 }
 
-function isBreakingError(err: CompatError): boolean {
+/**
+ * Classify a compat error into one of the five change categories.
+ *
+ * - api-breaking:    API-level breaking change (affects all consumers)
+ * - sdk-breaking:    SDK-level breaking change (TypeScript SDK consumers only)
+ * - hardened:        Response contract hardened (null removed from response union)
+ * - exhaustiveness:  Enum gained a new member
+ * - additive:        New optional property added
+ */
+function categorizeError(err: CompatError): ChangeCategory {
   const summary = summarizeError(err);
-  if (!summary) return true;
-  return summary.category !== 'enum-member-added';
+  if (!summary) return 'api-breaking';
+
+  switch (summary.category) {
+    case 'enum-member-added':
+      return 'exhaustiveness';
+    case 'branded-type':
+      return 'sdk-breaking';
+    case 'null-removed': {
+      // null removed from response union = hardened contract (non-breaking)
+      // null removed from request union = API breaking
+      const role = classifyRole(err.typeName);
+      if (role === 'response') return 'hardened';
+      if (role === 'request') return 'api-breaking';
+      // Unknown role: use check direction as hint
+      return (err.direction === 'response' || err.direction === 'reverse')
+        ? 'hardened'
+        : 'api-breaking';
+    }
+    default:
+      return 'api-breaking';
+  }
 }
 
-function annotationForError(err: CompatError): string | undefined {
-  const summary = summarizeError(err);
-  if (!summary) return undefined;
-  if (summary.category === 'enum-member-added') return 'Exhaustiveness';
-  if (summary.category === 'branded-type') return 'Type Safety';
-  return undefined;
+function isBreakingCategory(cat: ChangeCategory): boolean {
+  return cat === 'api-breaking' || cat === 'sdk-breaking';
 }
 
-function categorize(isBreaking: boolean, annotation?: string): ChangeCategory {
-  if (isBreaking) return 'breaking';
-  if (annotation === 'Exhaustiveness') return 'exhaustiveness';
-  return 'additive';
+function annotationForCategory(cat: ChangeCategory): string | undefined {
+  switch (cat) {
+    case 'sdk-breaking': return 'Type Safety';
+    case 'exhaustiveness': return 'Exhaustiveness';
+    case 'hardened': return 'Hardened Contract';
+    default: return undefined;
+  }
 }
 
 function formatError(err: CompatError): string {
@@ -155,13 +182,13 @@ function buildChangedGroups(result: CompatResult): {
 
   for (const err of result.errors) {
     if (err.code === 'TS2724') continue;
-    const breaking = isBreakingError(err);
-    const annotation = annotationForError(err);
+    const category = categorizeError(err);
+    const annotation = annotationForCategory(category);
     addItem(err.typeName, {
       text: formatError(err),
-      isBreaking: breaking,
+      isBreaking: isBreakingCategory(category),
       annotation,
-      category: categorize(breaking, annotation),
+      category,
       sourceType: err.typeName,
     });
   }
@@ -185,7 +212,7 @@ function buildChangedGroups(result: CompatResult): {
     addItem(change.typeName, {
       text: `Removed property \`${change.property}\`${typeStr}`,
       isBreaking: true,
-      category: 'breaking',
+      category: 'api-breaking',
       sourceType: change.typeName,
     });
   }
@@ -277,16 +304,23 @@ function renderItemInSection(
   if (item.annotation) {
     // Suppress annotation that matches the section heading (redundant)
     const suppress =
-      section === 'exhaustiveness' && item.annotation === 'Exhaustiveness';
+      (section === 'exhaustiveness' && item.annotation === 'Exhaustiveness') ||
+      (section === 'sdk-breaking' && item.annotation === 'Type Safety') ||
+      (section === 'hardened' && item.annotation === 'Hardened Contract');
     if (!suppress) {
       text += ` *(${item.annotation})*`;
     }
   }
-  if (item.annotation === 'Type Safety') {
-    text = `🛡️ ${text}`;
-  }
-  if (item.isBreaking) {
-    text = `🔴 ${text} (breaking)`;
+  switch (item.category) {
+    case 'api-breaking':
+      text = `🔴 ${text} (breaking)`;
+      break;
+    case 'sdk-breaking':
+      text = `🛡️ ${text} (SDK breaking)`;
+      break;
+    case 'hardened':
+      text = `🟢 ${text}`;
+      break;
   }
   return text;
 }
@@ -404,16 +438,39 @@ function renderSeveritySection(
   }
 }
 
-export function countBreaking(result: CompatResult): number {
-  const breakingTypes = new Set<string>(result.removedTypes);
+interface ChangeCounts {
+  apiBreaking: number;
+  sdkBreaking: number;
+  hardened: number;
+}
+
+function countChanges(result: CompatResult): ChangeCounts {
+  const apiBreakingTypes = new Set<string>(result.removedTypes);
+  const sdkBreakingTypes = new Set<string>();
+  const hardenedTypes = new Set<string>();
+
   for (const err of result.errors) {
     if (err.code === 'TS2724') continue;
-    if (isBreakingError(err)) breakingTypes.add(err.typeName);
+    const cat = categorizeError(err);
+    if (cat === 'api-breaking') apiBreakingTypes.add(err.typeName);
+    else if (cat === 'sdk-breaking') sdkBreakingTypes.add(err.typeName);
+    else if (cat === 'hardened') hardenedTypes.add(err.typeName);
   }
+
   for (const change of result.removedProperties) {
-    breakingTypes.add(change.typeName);
+    apiBreakingTypes.add(change.typeName);
   }
-  return breakingTypes.size;
+
+  return {
+    apiBreaking: apiBreakingTypes.size,
+    sdkBreaking: sdkBreakingTypes.size,
+    hardened: hardenedTypes.size,
+  };
+}
+
+export function countBreaking(result: CompatResult): number {
+  const counts = countChanges(result);
+  return counts.apiBreaking + counts.sdkBreaking;
 }
 
 const REGRESSION_CATEGORIES = new Set([
@@ -429,10 +486,13 @@ const REGRESSION_CATEGORIES = new Set([
  * Filter a CompatResult to only include regression-disallowed changes:
  * removed enum members, missing types, type widening, property type changes,
  * missing properties, optional→required request fields, required→optional response fields.
+ * Hardened contract changes (null removed from response) are excluded.
  */
 export function filterForRegression(result: CompatResult): CompatResult {
   const filteredErrors = result.errors.filter((err) => {
     if (err.code === 'TS2724') return true; // removed type
+    // Hardened contract changes are not regressions
+    if (categorizeError(err) === 'hardened') return false;
     const summary = summarizeError(err);
     if (!summary) return true; // unknown = potentially disallowed
     return REGRESSION_CATEGORIES.has(summary.category);
@@ -503,7 +563,7 @@ export function generateReport(
   const { newOperations, newSchemas } = groupNewTypes(
     result.addedTypes
   );
-  const breakingCount = countBreaking(result);
+  const counts = countChanges(result);
 
   // Summary
   lines.push('## Summary');
@@ -524,11 +584,17 @@ export function generateReport(
     `| Removed properties | ${result.removedProperties.length} |`
   );
   lines.push(
-    `| **Breaking changes** | **${breakingCount}** |`
+    `| **API breaking changes** | **${counts.apiBreaking}** |`
+  );
+  lines.push(
+    `| SDK breaking changes | ${counts.sdkBreaking} |`
+  );
+  lines.push(
+    `| Hardened contract | ${counts.hardened} |`
   );
   lines.push('');
   lines.push(
-    '> Enum member additions are not counted as breaking changes.'
+    '> Enum member additions are not counted as breaking changes. Response fields where `null` was removed from the union are classified as hardened contract (non-breaking).'
   );
   lines.push('');
 
@@ -540,13 +606,16 @@ export function generateReport(
   );
   lines.push('|---|---|');
   lines.push(
-    '| **(breaking change)** | Existing application code will not compile with this SDK version without modification. |'
+    '| 🔴 **(breaking)** | API-level breaking change. Affects all consumers of the REST API. |'
+  );
+  lines.push(
+    '| 🛡️ **(SDK breaking)** | SDK-level breaking change. Affects TypeScript SDK consumers only (e.g. branded types). Existing API calls still work. |'
+  );
+  lines.push(
+    '| 🟢 **(hardened)** | Response contract hardened. The API now guarantees a non-null value. Existing null checks still work at runtime. |'
   );
   lines.push(
     '| *(Exhaustiveness)* | An enum gained a new member. Existing code compiles, but `switch` statements without a `default` case may trigger exhaustiveness warnings. |'
-  );
-  lines.push(
-    '| *(Type Safety)* | A primitive (`string`) was replaced with a branded type, providing enhanced type safety. Existing code that passes raw strings will need to use the branded constructor. |'
   );
   lines.push('');
 
@@ -563,14 +632,34 @@ export function generateReport(
     return lines.join('\n');
   }
 
-  // Breaking Changes (includes removed types)
+  // API Breaking Changes (includes removed types)
   renderSeveritySection(
     lines,
-    'Breaking Changes',
-    'breaking',
+    'API Breaking Changes',
+    'api-breaking',
     changedOps,
     changedSchemas,
     result.removedTypes
+  );
+
+  // SDK Breaking Changes
+  renderSeveritySection(
+    lines,
+    'SDK Breaking Changes',
+    'sdk-breaking',
+    changedOps,
+    changedSchemas,
+    []
+  );
+
+  // Hardened Contract
+  renderSeveritySection(
+    lines,
+    'Hardened Contract',
+    'hardened',
+    changedOps,
+    changedSchemas,
+    []
   );
 
   // Exhaustiveness
@@ -653,6 +742,7 @@ export function generateJsonReport(
   mode: ReportMode = 'migration',
   metadata?: ReportMetadata
 ): string {
+  const jsonCounts = countChanges(result);
   const changes: Array<{
     category: string;
     changeType: string;
@@ -667,10 +757,9 @@ export function generateJsonReport(
   for (const err of result.errors) {
     if (err.code === 'TS2724') continue; // handled via removedTypes
     const summary = summarizeError(err);
-    const breaking = isBreakingError(err);
-    const annotation = annotationForError(err);
+    const category = categorizeError(err);
     changes.push({
-      category: categorize(breaking, annotation),
+      category,
       changeType: summary?.category ?? 'unknown',
       description: formatError(err),
       operation: extractOperation(err.typeName)?.[0] ?? null,
@@ -698,7 +787,7 @@ export function generateJsonReport(
   for (const change of result.removedProperties) {
     const typeStr = change.propertyType ? `: ${change.propertyType}` : '';
     changes.push({
-      category: 'breaking',
+      category: 'api-breaking',
       changeType: 'removed-property',
       description: `Removed property ${change.property}${typeStr}`,
       operation: extractOperation(change.typeName)?.[0] ?? null,
@@ -710,9 +799,11 @@ export function generateJsonReport(
 
   // Sort deterministically: category → typeName → description
   const categoryOrder: Record<string, number> = {
-    breaking: 0,
-    exhaustiveness: 1,
-    additive: 2,
+    'api-breaking': 0,
+    'sdk-breaking': 1,
+    hardened: 2,
+    exhaustiveness: 3,
+    additive: 4,
   };
   changes.sort((a, b) => {
     const ca = categoryOrder[a.category] ?? 99;
@@ -741,11 +832,13 @@ export function generateJsonReport(
     summary: {
       addedTypeCount: result.addedTypes.length,
       additivePropertyChangeCount: result.additiveChanges.length,
-      breakingChangeCount: countBreaking(result),
+      apiBreakingChangeCount: jsonCounts.apiBreaking,
       currentTypeCount: result.currentCount,
+      hardenedContractCount: jsonCounts.hardened,
       incompatibleTypeCount: result.incompatibleTypes.length,
       removedPropertyCount: result.removedProperties.length,
       removedTypeCount: result.removedTypes.length,
+      sdkBreakingChangeCount: jsonCounts.sdkBreaking,
       stableTypeCount: result.stableCount,
     },
   };

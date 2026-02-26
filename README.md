@@ -42,7 +42,20 @@ Raw tsc error chains are summarized into one-liners:
 | `became-optional` | `.items`: became optional (was required `Result[]`) |
 | `became-required` | `.name`: became required (was optional `string`) |
 | `branded-type` | `.key.$eq`: `string` → branded `ProcessDefinitionKey` |
+| `null-removed` | `.field`: `null` removed from union |
 | `type-changed` | `.count`: `number` changed to `string` |
+
+### Change classification
+
+Changes are classified into five categories, distinguishing API-level from SDK-level impact:
+
+| Category | Icon | Scope | Description |
+|---|---|---|---|
+| **API Breaking** | 🔴 | All consumers | Removed types, enum member removal, required field added to request, type changes |
+| **SDK Breaking** | 🛡️ | TypeScript SDK only | Branded types (`string` → `TenantId`). The REST API still accepts plain strings. |
+| **Hardened Contract** | 🟢 | Non-breaking | `null` removed from response union. The API now guarantees non-null; existing null checks still work. |
+| **Exhaustiveness** | — | Non-breaking | Enum gained a new member. `switch` without `default` may warn. |
+| **Additive** | — | Non-breaking | New optional properties added to existing types. |
 
 ### Operation grouping
 
@@ -91,13 +104,15 @@ npx tsx src/cli.ts ./my-sdk stable/1.0 main --out-dir ./reports
 
 The tool writes a Markdown report to `<out-dir>/<stable-version>-><current-version>.md` with these sections:
 
-1. **Summary** — counts table (baseline types, current types, removed, incompatible, new, additive, removed properties)
-2. **Removed Types** — types that no longer exist
-3. **Incompatible Types** — types that exist in both versions but are structurally incompatible, with summarized error details
-4. **Additive Property Changes** — new properties added to existing types
-5. **Removed Properties** — properties removed from existing types
-6. **New Types** — types only in the current version
-7. **Changes by Operation** — all changes grouped by API operation name
+1. **Summary** — counts table (baseline types, current types, API breaking, SDK breaking, hardened contract)
+2. **Legend** — explains icons and annotations
+3. **API Breaking Changes** — changes that affect all consumers of the REST API
+4. **SDK Breaking Changes** — changes that only affect TypeScript SDK consumers (e.g. branded types)
+5. **Hardened Contract** — response fields where `null` was removed (non-breaking improvement)
+6. **Exhaustiveness** — enum members added (may affect exhaustive `switch` statements)
+7. **Additive Changes** — new optional properties added to existing types
+8. **New** — entirely new types and operations
+9. **Changes by Operation** — all changes grouped by API operation name
 
 ## Project structure
 
