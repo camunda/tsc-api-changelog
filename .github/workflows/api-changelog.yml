@@ -8,9 +8,18 @@ on:
         required: true
         type: string
 
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
   api-changelog:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - name: Checkout tsc-api-changelog
         uses: actions/checkout@v4
@@ -74,6 +83,21 @@ jobs:
             --format json \
             --output "reports/${{ steps.timestamp.outputs.ts }}_${{ steps.branch.outputs.safe }}.json" \
             || true
+
+      - name: Display report in summary
+        run: |
+          REPORT="reports/${{ steps.timestamp.outputs.ts }}_${{ steps.branch.outputs.safe }}.md"
+          {
+            echo "## API Changelog"
+            echo ""
+            echo "**Branch:** \`${{ inputs.camunda_branch }}\`  |  **Date:** $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo ""
+            if [[ -f "$REPORT" ]]; then
+              cat "$REPORT"
+            else
+              echo "_No markdown report was generated._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload reports
         uses: actions/upload-artifact@v4
