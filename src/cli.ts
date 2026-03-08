@@ -23,6 +23,7 @@ import {
   generateReport,
 } from './report.js';
 import type { ReportMetadata, ReportMode } from './report.js';
+import { buildRoleMap } from './roles.js';
 
 interface CliOptions {
   repoPath: string;
@@ -173,6 +174,13 @@ function main(): void {
     console.error(
       `Types: ${stableNames.size} stable, ${currentNames.size} current`
     );
+
+    // Build role map from the current types file (structural inference)
+    console.error('Building role map from type graph...');
+    const roleMap = buildRoleMap(current.path);
+    console.error(
+      `Role map: ${[...roleMap.values()].filter((r) => r === 'request').length} request, ${[...roleMap.values()].filter((r) => r === 'response').length} response, ${[...roleMap.values()].filter((r) => r === 'unknown').length} ambiguous`
+    );
     console.error('');
 
     // Run compatibility check
@@ -182,16 +190,17 @@ function main(): void {
       current.path,
       tmpDir,
       stableNames,
-      currentNames
+      currentNames,
+      roleMap
     );
 
     // Apply regression filter if needed
     const finalResult =
       opts.mode === 'regression'
-        ? filterForRegression(result)
+        ? filterForRegression(result, roleMap)
         : result;
 
-    const breakingCount = countBreaking(finalResult);
+    const breakingCount = countBreaking(finalResult, roleMap);
     console.error(
       `Found ${breakingCount} breaking changes`
     );
@@ -218,14 +227,16 @@ function main(): void {
             current.version,
             finalResult,
             opts.mode,
-            metadata
+            metadata,
+            roleMap
           )
         : generateReport(
             stable.version,
             current.version,
             finalResult,
             opts.mode,
-            metadata
+            metadata,
+            roleMap
           );
 
     // Output report

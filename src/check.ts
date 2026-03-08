@@ -14,7 +14,7 @@ import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { classifyRole } from './roles.js';
+import { classifyRoleFromMap, type RoleMap } from './roles.js';
 import { getPropertyTypes } from './extract.js';
 
 export interface CompatError {
@@ -51,7 +51,8 @@ export interface CompatResult {
 export function generateCompatCheckSource(
   baselineNames: Set<string>,
   stableFileName: string,
-  currentFileName: string
+  currentFileName: string,
+  roleMap: RoleMap = new Map()
 ): string {
   const lines: string[] = [];
   lines.push('// Auto-generated API compatibility check');
@@ -68,7 +69,7 @@ export function generateCompatCheckSource(
   lines.push('');
 
   for (const name of [...baselineNames].sort()) {
-    const role = classifyRole(name);
+    const role = classifyRoleFromMap(name, roleMap);
     const safeId = name.replace(/[^a-zA-Z0-9_]/g, '_');
 
     if (role === 'request') {
@@ -393,7 +394,8 @@ export function runCompatCheck(
   currentPath: string,
   workDir: string,
   stableNames: Set<string>,
-  currentNames: Set<string>
+  currentNames: Set<string>,
+  roleMap: RoleMap = new Map()
 ): CompatResult {
   const stableFile = path.basename(stablePath);
   const currentFile = path.basename(currentPath);
@@ -402,7 +404,8 @@ export function runCompatCheck(
   const checkSource = generateCompatCheckSource(
     stableNames,
     stableFile,
-    currentFile
+    currentFile,
+    roleMap
   );
 
   const checkPath = path.join(workDir, 'compat-check.ts');

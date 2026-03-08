@@ -2,7 +2,7 @@
  * Markdown report generation from compatibility check results.
  */
 
-import { classifyRole } from './roles.js';
+import { classifyRole, classifyRoleFromMap, type RoleMap } from './roles.js';
 import type { CompatError, CompatResult } from './check.js';
 import { summarizeError } from './summarize.js';
 
@@ -86,7 +86,7 @@ interface SchemaGroup {
  * - exhaustiveness:  Enum gained a new member
  * - additive:        New optional property added
  */
-function categorizeError(err: CompatError): ChangeCategory {
+function categorizeError(err: CompatError, roleMap: RoleMap = new Map()): ChangeCategory {
   const summary = summarizeError(err);
   if (!summary) return 'api-breaking';
 
@@ -98,7 +98,7 @@ function categorizeError(err: CompatError): ChangeCategory {
     case 'null-removed': {
       // null removed from response union = hardened contract (non-breaking)
       // null removed from request union = API breaking
-      const role = classifyRole(err.typeName);
+      const role = classifyRoleFromMap(err.typeName, roleMap);
       if (role === 'response') return 'hardened';
       if (role === 'request') return 'api-breaking';
       // Unknown role: use check direction as hint
@@ -137,7 +137,7 @@ function formatError(err: CompatError): string {
   return msg || err.message;
 }
 
-function buildChangedGroups(result: CompatResult): {
+function buildChangedGroups(result: CompatResult, roleMap: RoleMap = new Map()): {
   operations: OperationGroup[];
   schemas: SchemaGroup[];
 } {
@@ -182,7 +182,7 @@ function buildChangedGroups(result: CompatResult): {
 
   for (const err of result.errors) {
     if (err.code === 'TS2724') continue;
-    const category = categorizeError(err);
+    const category = categorizeError(err, roleMap);
     const annotation = annotationForCategory(category);
     addItem(err.typeName, {
       text: formatError(err),
@@ -337,7 +337,8 @@ function renderSeveritySection(
   section: ChangeCategory,
   operations: OperationGroup[],
   schemas: SchemaGroup[],
-  removedTypes: string[]
+  removedTypes: string[],
+  roleMap: RoleMap = new Map()
 ): void {
   const entries: SectionEntry[] = [];
 
@@ -394,7 +395,7 @@ function renderSeveritySection(
     );
     if (items.length === 0) continue;
 
-    const role = classifyRole(schema.name);
+    const role = classifyRoleFromMap(schema.name, roleMap);
     const roleLabel =
       role === 'request'
         ? ' (request)'
@@ -444,14 +445,14 @@ interface ChangeCounts {
   hardened: number;
 }
 
-function countChanges(result: CompatResult): ChangeCounts {
+function countChanges(result: CompatResult, roleMap: RoleMap = new Map()): ChangeCounts {
   const apiBreakingTypes = new Set<string>(result.removedTypes);
   const sdkBreakingTypes = new Set<string>();
   const hardenedTypes = new Set<string>();
 
   for (const err of result.errors) {
     if (err.code === 'TS2724') continue;
-    const cat = categorizeError(err);
+    const cat = categorizeError(err, roleMap);
     if (cat === 'api-breaking') apiBreakingTypes.add(err.typeName);
     else if (cat === 'sdk-breaking') sdkBreakingTypes.add(err.typeName);
     else if (cat === 'hardened') hardenedTypes.add(err.typeName);
@@ -468,8 +469,8 @@ function countChanges(result: CompatResult): ChangeCounts {
   };
 }
 
-export function countBreaking(result: CompatResult): number {
-  const counts = countChanges(result);
+export function countBreaking(result: CompatResult, roleMap: RoleMap = new Map()): number {
+  const counts = countChanges(result, roleMap);
   return counts.apiBreaking + counts.sdkBreaking;
 }
 
@@ -488,11 +489,11 @@ const REGRESSION_CATEGORIES = new Set([
  * missing properties, optional→required request fields, required→optional response fields.
  * Hardened contract changes (null removed from response) are excluded.
  */
-export function filterForRegression(result: CompatResult): CompatResult {
+export function filterForRegression(result: CompatResult, roleMap: RoleMap = new Map()): CompatResult {
   const filteredErrors = result.errors.filter((err) => {
     if (err.code === 'TS2724') return true; // removed type
     // Hardened contract changes are not regressions
-    if (categorizeError(err) === 'hardened') return false;
+    if (categorizeError(err, roleMap) === 'hardened') return false;
     const summary = summarizeError(err);
     if (!summary) return true; // unknown = potentially disallowed
     return REGRESSION_CATEGORIES.has(summary.category);
@@ -523,7 +524,8 @@ export function generateReport(
   currentVersion: string,
   result: CompatResult,
   mode: ReportMode = 'migration',
-  metadata?: ReportMetadata
+  metadata?: ReportMetadata,
+  roleMap: RoleMap = new Map()
 ): string {
   const lines: string[] = [];
 
@@ -559,11 +561,11 @@ export function generateReport(
   lines.push('');
 
   const { operations: changedOps, schemas: changedSchemas } =
-    buildChangedGroups(result);
+    buildChangedGroups(result, roleMap);
   const { newOperations, newSchemas } = groupNewTypes(
     result.addedTypes
   );
-  const counts = countChanges(result);
+  const counts = countChanges(result, roleMap);
 
   // Summary
   lines.push('## Summary');
@@ -639,27 +641,8 @@ export function generateReport(
     'api-breaking',
     changedOps,
     changedSchemas,
-    result.removedTypes
-  );
-
-  // SDK Breaking Changes
-  renderSeveritySection(
-    lines,
-    'SDK Breaking Changes',
-    'sdk-breaking',
-    changedOps,
-    changedSchemas,
-    []
-  );
-
-  // Hardened Contract
-  renderSeveritySection(
-    lines,
-    'Hardened Contract',
-    'hardened',
-    changedOps,
-    changedSchemas,
-    []
+    result.removedTypes,
+    roleMap
   );
 
   // Exhaustiveness
@@ -669,7 +652,30 @@ export function generateReport(
     'exhaustiveness',
     changedOps,
     changedSchemas,
-    []
+    [],
+    roleMap
+  );
+
+  // SDK Breaking Changes
+  renderSeveritySection(
+    lines,
+    'SDK Breaking Changes',
+    'sdk-breaking',
+    changedOps,
+    changedSchemas,
+    [],
+    roleMap
+  );
+
+  // Hardened Contract
+  renderSeveritySection(
+    lines,
+    'Hardened Contract',
+    'hardened',
+    changedOps,
+    changedSchemas,
+    [],
+    roleMap
   );
 
   // Additive Changes
@@ -679,7 +685,8 @@ export function generateReport(
     'additive',
     changedOps,
     changedSchemas,
-    []
+    [],
+    roleMap
   );
 
   // New
@@ -740,9 +747,10 @@ export function generateJsonReport(
   currentVersion: string,
   result: CompatResult,
   mode: ReportMode = 'migration',
-  metadata?: ReportMetadata
+  metadata?: ReportMetadata,
+  roleMap: RoleMap = new Map()
 ): string {
-  const jsonCounts = countChanges(result);
+  const jsonCounts = countChanges(result, roleMap);
   const changes: Array<{
     category: string;
     changeType: string;
@@ -757,14 +765,14 @@ export function generateJsonReport(
   for (const err of result.errors) {
     if (err.code === 'TS2724') continue; // handled via removedTypes
     const summary = summarizeError(err);
-    const category = categorizeError(err);
+    const category = categorizeError(err, roleMap);
     changes.push({
       category,
       changeType: summary?.category ?? 'unknown',
       description: formatError(err),
       operation: extractOperation(err.typeName)?.[0] ?? null,
       propertyPath: summary?.propertyPath ?? null,
-      role: classifyRole(err.typeName),
+      role: classifyRoleFromMap(err.typeName, roleMap),
       typeName: err.typeName,
     });
   }
@@ -778,7 +786,7 @@ export function generateJsonReport(
       description: `Added property ${change.property}${typeStr}`,
       operation: extractOperation(change.typeName)?.[0] ?? null,
       propertyPath: `.${change.property}`,
-      role: classifyRole(change.typeName),
+      role: classifyRoleFromMap(change.typeName, roleMap),
       typeName: change.typeName,
     });
   }
@@ -792,7 +800,7 @@ export function generateJsonReport(
       description: `Removed property ${change.property}${typeStr}`,
       operation: extractOperation(change.typeName)?.[0] ?? null,
       propertyPath: `.${change.property}`,
-      role: classifyRole(change.typeName),
+      role: classifyRoleFromMap(change.typeName, roleMap),
       typeName: change.typeName,
     });
   }
