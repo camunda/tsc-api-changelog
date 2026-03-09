@@ -52,6 +52,7 @@ const SUFFIX_ROLE: Record<string, 'Request' | 'Response'> = {
 };
 
 type ChangeCategory = 'api-breaking' | 'sdk-breaking' | 'hardened' | 'exhaustiveness' | 'additive';
+type SectionCategory = ChangeCategory | 'sdk-impact';
 
 interface ChangeItem {
   text: string;
@@ -298,14 +299,14 @@ function deduplicateItems(items: ChangeItem[]): ChangeItem[] {
 
 function renderItemInSection(
   item: ChangeItem,
-  section: ChangeCategory
+  section: SectionCategory
 ): string {
   let text = item.text;
   if (item.annotation) {
     // Suppress annotation that matches the section heading (redundant)
     const suppress =
       (section === 'exhaustiveness' && item.annotation === 'Exhaustiveness') ||
-      (section === 'sdk-breaking' && item.annotation === 'Type Safety') ||
+      ((section === 'sdk-breaking' || section === 'sdk-impact') && item.annotation === 'Type Safety') ||
       (section === 'hardened' && item.annotation === 'Hardened Contract');
     if (!suppress) {
       text += ` *(${item.annotation})*`;
@@ -334,22 +335,42 @@ interface SectionEntry {
 function renderSeveritySection(
   lines: string[],
   heading: string,
-  section: ChangeCategory,
+  section: SectionCategory,
   operations: OperationGroup[],
   schemas: SchemaGroup[],
   removedTypes: string[],
   roleMap: RoleMap = new Map()
 ): void {
   const entries: SectionEntry[] = [];
+  const requestOps = new Set<string>();
+  const responseOps = new Set<string>();
+  const standaloneSchemas = new Set<string>();
+
+  const matchesSection = (item: ChangeItem): boolean => {
+    if (section === 'sdk-impact') {
+      return item.category === 'api-breaking' || item.category === 'sdk-breaking';
+    }
+    return item.category === section;
+  };
 
   for (const op of operations) {
     const reqItems = deduplicateItems(
-      op.request.items.filter((i) => i.category === section)
+      op.request.items.filter(matchesSection)
     );
     const resItems = deduplicateItems(
-      op.response.items.filter((i) => i.category === section)
+      op.response.items.filter(matchesSection)
     );
     if (reqItems.length === 0 && resItems.length === 0) continue;
+
+    if (
+      section === 'api-breaking' ||
+      section === 'sdk-breaking' ||
+      section === 'sdk-impact' ||
+      section === 'exhaustiveness'
+    ) {
+      if (reqItems.length > 0) requestOps.add(op.name);
+      if (resItems.length > 0) responseOps.add(op.name);
+    }
 
     const subLines: string[] = [];
     subLines.push(`### ${op.name}`);
@@ -391,9 +412,13 @@ function renderSeveritySection(
 
   for (const schema of schemas) {
     const items = deduplicateItems(
-      schema.items.filter((i) => i.category === section)
+      schema.items.filter(matchesSection)
     );
     if (items.length === 0) continue;
+
+    if (section === 'api-breaking' || section === 'sdk-impact') {
+      standaloneSchemas.add(schema.name);
+    }
 
     const role = classifyRoleFromMap(schema.name, roleMap);
     const roleLabel =
@@ -417,6 +442,20 @@ function renderSeveritySection(
 
   // Removed types appear in the breaking section
   for (const name of removedTypes.sort()) {
+    if (section === 'api-breaking' || section === 'sdk-impact') {
+      const op = extractOperation(name);
+      if (op) {
+        const [opName, suffix] = op;
+        if (SUFFIX_ROLE[suffix] === 'Request') {
+          requestOps.add(opName);
+        } else {
+          responseOps.add(opName);
+        }
+      } else {
+        standaloneSchemas.add(name);
+      }
+    }
+
     entries.push({
       sortKey: name,
       kind: 'schema',
@@ -434,6 +473,42 @@ function renderSeveritySection(
 
   lines.push(`## ${heading}`);
   lines.push('');
+
+  if (
+    section === 'api-breaking' ||
+    section === 'sdk-breaking' ||
+    section === 'sdk-impact' ||
+    section === 'exhaustiveness'
+  ) {
+    const allOps = [...new Set([...requestOps, ...responseOps])].sort();
+    const reqOps = [...requestOps].sort();
+    const resOps = [...responseOps].sort();
+    const schemasList = [...standaloneSchemas].sort();
+
+    const formatList = (items: string[]): string =>
+      items.length > 0
+        ? items.map((item) => `\`${item}\``).join(', ')
+        : 'none';
+
+    lines.push(
+      `**${allOps.length} impacted API operations** (${formatList(allOps)})`
+    );
+    lines.push(
+      `Request operations: ${formatList(reqOps)}`
+    );
+    lines.push(
+      `Response operations: ${formatList(resOps)}`
+    );
+
+    if (section === 'api-breaking' || section === 'sdk-impact') {
+      lines.push(
+        `**${schemasList.length} impacted standalone schema types** (${formatList(schemasList)})`
+      );
+    }
+
+    lines.push('');
+  }
+
   for (const entry of entries) {
     lines.push(...entry.lines);
   }
@@ -441,30 +516,128 @@ function renderSeveritySection(
 
 interface ChangeCounts {
   apiBreaking: number;
+  apiBreakingOperations: number;
+  apiBreakingRequestOperations: number;
+  apiBreakingResponseOperations: number;
   sdkBreaking: number;
+  sdkBreakingRequestOperations: number;
+  sdkBreakingResponseOperations: number;
+  sdkImpactRequestOperations: number;
+  sdkImpactResponseOperations: number;
+  exhaustivenessRequestOperations: number;
+  exhaustivenessResponseOperations: number;
   hardened: number;
 }
 
 function countChanges(result: CompatResult, roleMap: RoleMap = new Map()): ChangeCounts {
   const apiBreakingTypes = new Set<string>(result.removedTypes);
+  const apiBreakingOperations = new Set<string>();
+  const apiBreakingRequestOperations = new Set<string>();
+  const apiBreakingResponseOperations = new Set<string>();
   const sdkBreakingTypes = new Set<string>();
+  const sdkBreakingRequestOperations = new Set<string>();
+  const sdkBreakingResponseOperations = new Set<string>();
+  const sdkImpactRequestOperations = new Set<string>();
+  const sdkImpactResponseOperations = new Set<string>();
+  const exhaustivenessRequestOperations = new Set<string>();
+  const exhaustivenessResponseOperations = new Set<string>();
   const hardenedTypes = new Set<string>();
+
+  function trackOperation(
+    typeName: string,
+    requestOps: Set<string>,
+    responseOps: Set<string>,
+    allOps?: Set<string>
+  ): void {
+    const op = extractOperation(typeName);
+    if (!op) return;
+    const [opName, suffix] = op;
+    allOps?.add(opName);
+    if (SUFFIX_ROLE[suffix] === 'Request') requestOps.add(opName);
+    else responseOps.add(opName);
+  }
+
+  for (const removedType of result.removedTypes) {
+    trackOperation(
+      removedType,
+      apiBreakingRequestOperations,
+      apiBreakingResponseOperations,
+      apiBreakingOperations
+    );
+    trackOperation(
+      removedType,
+      sdkImpactRequestOperations,
+      sdkImpactResponseOperations
+    );
+  }
 
   for (const err of result.errors) {
     if (err.code === 'TS2724') continue;
     const cat = categorizeError(err, roleMap);
-    if (cat === 'api-breaking') apiBreakingTypes.add(err.typeName);
-    else if (cat === 'sdk-breaking') sdkBreakingTypes.add(err.typeName);
+    if (cat === 'api-breaking') {
+      apiBreakingTypes.add(err.typeName);
+      trackOperation(
+        err.typeName,
+        apiBreakingRequestOperations,
+        apiBreakingResponseOperations,
+        apiBreakingOperations
+      );
+      trackOperation(
+        err.typeName,
+        sdkImpactRequestOperations,
+        sdkImpactResponseOperations
+      );
+    }
+    else if (cat === 'sdk-breaking') {
+      sdkBreakingTypes.add(err.typeName);
+      trackOperation(
+        err.typeName,
+        sdkBreakingRequestOperations,
+        sdkBreakingResponseOperations
+      );
+      trackOperation(
+        err.typeName,
+        sdkImpactRequestOperations,
+        sdkImpactResponseOperations
+      );
+    }
+    else if (cat === 'exhaustiveness') {
+      trackOperation(
+        err.typeName,
+        exhaustivenessRequestOperations,
+        exhaustivenessResponseOperations
+      );
+    }
     else if (cat === 'hardened') hardenedTypes.add(err.typeName);
   }
 
   for (const change of result.removedProperties) {
     apiBreakingTypes.add(change.typeName);
+    trackOperation(
+      change.typeName,
+      apiBreakingRequestOperations,
+      apiBreakingResponseOperations,
+      apiBreakingOperations
+    );
+    trackOperation(
+      change.typeName,
+      sdkImpactRequestOperations,
+      sdkImpactResponseOperations
+    );
   }
 
   return {
     apiBreaking: apiBreakingTypes.size,
+    apiBreakingOperations: apiBreakingOperations.size,
+    apiBreakingRequestOperations: apiBreakingRequestOperations.size,
+    apiBreakingResponseOperations: apiBreakingResponseOperations.size,
     sdkBreaking: sdkBreakingTypes.size,
+    sdkBreakingRequestOperations: sdkBreakingRequestOperations.size,
+    sdkBreakingResponseOperations: sdkBreakingResponseOperations.size,
+    sdkImpactRequestOperations: sdkImpactRequestOperations.size,
+    sdkImpactResponseOperations: sdkImpactResponseOperations.size,
+    exhaustivenessRequestOperations: exhaustivenessRequestOperations.size,
+    exhaustivenessResponseOperations: exhaustivenessResponseOperations.size,
     hardened: hardenedTypes.size,
   };
 }
@@ -586,10 +759,13 @@ export function generateReport(
     `| Removed properties | ${result.removedProperties.length} |`
   );
   lines.push(
-    `| **API breaking changes** | **${counts.apiBreaking}** |`
+    `| **API breaking changes** | **${counts.apiBreakingRequestOperations} Request Operations / ${counts.apiBreakingResponseOperations} Response Operations** |`
   );
   lines.push(
-    `| SDK breaking changes | ${counts.sdkBreaking} |`
+    `| SDK breaking changes | ${counts.sdkImpactRequestOperations} Request Operations / ${counts.sdkImpactResponseOperations} Response Operations |`
+  );
+  lines.push(
+    `| Enum extension (exhaustiveness) | ${counts.exhaustivenessRequestOperations} Request Operations / ${counts.exhaustivenessResponseOperations} Response Operations |`
   );
   lines.push(
     `| Hardened contract | ${counts.hardened} |`
@@ -645,22 +821,22 @@ export function generateReport(
     roleMap
   );
 
+  // SDK Breaking Changes
+  renderSeveritySection(
+    lines,
+    'SDK Breaking Changes',
+    'sdk-impact',
+    changedOps,
+    changedSchemas,
+    result.removedTypes,
+    roleMap
+  );
+
   // Exhaustiveness
   renderSeveritySection(
     lines,
     'Exhaustiveness',
     'exhaustiveness',
-    changedOps,
-    changedSchemas,
-    [],
-    roleMap
-  );
-
-  // SDK Breaking Changes
-  renderSeveritySection(
-    lines,
-    'SDK Breaking Changes',
-    'sdk-breaking',
     changedOps,
     changedSchemas,
     [],

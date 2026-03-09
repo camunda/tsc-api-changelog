@@ -3,12 +3,14 @@
  * CLI entry point for the type comparator.
  *
  * Usage:
- *   tsc-api-changelog --repo <path> --old <ref> --new <ref> [options]
+ *   tsc-api-changelog [--repo <path-or-url>] --old <ref> --new <ref> [options]
  *
  * Examples:
- *   tsc-api-changelog --repo ./orchestration-cluster-api-js --old v8.8.4 --new main
- *   tsc-api-changelog --repo /abs/path/to/repo --old stable/8.8 --new main --types-file src/gen/types.gen.ts
+ *   tsc-api-changelog --old v8.8.4 --new main
+ *   tsc-api-changelog --repo ./orchestration-cluster-api-js --old stable/8.8 --new main
+ *   tsc-api-changelog --repo https://github.com/camunda/orchestration-cluster-api-js --old stable/8.8 --new main
  */
+import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -26,7 +28,7 @@ import type { ReportMetadata, ReportMode } from './report.js';
 import { buildRoleMap } from './roles.js';
 
 interface CliOptions {
-  repoPath: string;
+  repoInput: string;
   stableRef: string;
   currentRef: string;
   typesFile: string;
@@ -35,19 +37,69 @@ interface CliOptions {
   format: 'markdown' | 'json';
 }
 
+const DEFAULT_REPO_URL =
+  'https://github.com/camunda/orchestration-cluster-api-js';
+
+function isGitUrl(value: string): boolean {
+  return /^(https?:\/\/|git@|ssh:\/\/)/.test(value);
+}
+
+function cloneRepo(repoUrl: string): { repoPath: string; cleanupDir: string } {
+  const cleanupDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'tsc-api-changelog-repo-')
+  );
+  const repoPath = path.join(cleanupDir, 'repo');
+
+  execSync(`git clone --no-tags --origin origin "${repoUrl}" "${repoPath}"`, {
+    encoding: 'utf-8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+
+  try {
+    execSync('git fetch --all --tags --prune', {
+      cwd: repoPath,
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch {
+    // Non-fatal: clone already has the default ref; some environments restrict fetch.
+  }
+
+  return { repoPath, cleanupDir };
+}
+
+function resolveRepoSource(repoInputRaw: string | null): {
+  repoInput: string;
+  repoPath: string;
+  cleanupDir: string | null;
+} {
+  const repoInput = repoInputRaw ?? DEFAULT_REPO_URL;
+
+  if (isGitUrl(repoInput)) {
+    const { repoPath, cleanupDir } = cloneRepo(repoInput);
+    return { repoInput, repoPath, cleanupDir };
+  }
+
+  return {
+    repoInput,
+    repoPath: path.resolve(repoInput),
+    cleanupDir: null,
+  };
+}
+
 function parseArgs(argv: string[]): CliOptions {
   const args = argv.slice(2); // strip node + script
   let typesFile = 'src/gen/types.gen.ts';
   let output: string | null = null;
   let mode: ReportMode = 'migration';
   let format: 'markdown' | 'json' = 'markdown';
-  let repoPath: string | null = null;
+  let repoInputRaw: string | null = null;
   let stableRef: string | null = null;
   let currentRef: string | null = null;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--repo' && i + 1 < args.length) {
-      repoPath = args[++i];
+      repoInputRaw = args[++i];
     } else if (args[i] === '--old' && i + 1 < args.length) {
       stableRef = args[++i];
     } else if (args[i] === '--new' && i + 1 < args.length) {
@@ -80,8 +132,9 @@ function parseArgs(argv: string[]): CliOptions {
     }
   }
 
+  const repoInput = repoInputRaw ?? DEFAULT_REPO_URL;
+
   const missing: string[] = [];
-  if (!repoPath) missing.push('--repo');
   if (!stableRef) missing.push('--old');
   if (!currentRef) missing.push('--new');
   if (missing.length > 0) {
@@ -91,7 +144,7 @@ function parseArgs(argv: string[]): CliOptions {
   }
 
   return {
-    repoPath: path.resolve(repoPath!),
+    repoInput,
     stableRef: stableRef!,
     currentRef: currentRef!,
     typesFile,
@@ -103,15 +156,16 @@ function parseArgs(argv: string[]): CliOptions {
 
 function printUsage(): void {
   console.log(`
-Usage: tsc-api-changelog --repo <path> --old <ref> --new <ref> [options]
+Usage: tsc-api-changelog [--repo <path-or-url>] --old <ref> --new <ref> [options]
 
 Required:
-  --repo <path>        Path to the git repository
   --old <ref>          Git ref for the stable/baseline version (tag, branch, SHA)
   --new <ref>          Git ref for the current/next version (tag, branch, SHA)
                        Use "WORKTREE" to read from the working directory
 
 Options:
+  --repo <path-or-url> Local git repo path or git URL to clone
+                       (default: ${DEFAULT_REPO_URL})
   --types-file <path>  Path to the types file within the repo
                        (default: src/gen/types.gen.ts)
   --output <path>      Output file path. If omitted, prints to stdout.
@@ -125,7 +179,17 @@ Options:
 }
 
 function main(): void {
-  const opts = parseArgs(process.argv);
+  const parsed = parseArgs(process.argv);
+  const { repoPath, cleanupDir, repoInput } = resolveRepoSource(parsed.repoInput);
+
+  const opts = {
+    ...parsed,
+    repoPath,
+    repoInput,
+  };
+
+  const cleanupPaths: string[] = [];
+  if (cleanupDir) cleanupPaths.push(cleanupDir);
 
   // Validate repo path
   if (!fs.existsSync(path.join(opts.repoPath, '.git'))) {
@@ -137,10 +201,12 @@ function main(): void {
   const tmpDir = fs.mkdtempSync(
     path.join(os.tmpdir(), 'tsc-api-changelog-')
   );
+  cleanupPaths.push(tmpDir);
 
   try {
     // Resolve types from both refs
-    console.error(`Repository: ${opts.repoPath}`);
+    console.error(`Repository source: ${opts.repoInput}`);
+    console.error(`Repository path: ${opts.repoPath}`);
     console.error(`Stable ref: ${opts.stableRef}`);
     console.error(`Current ref: ${opts.currentRef}`);
     console.error(`Types file: ${opts.typesFile}`);
@@ -251,7 +317,9 @@ function main(): void {
 
     process.exit(breakingCount > 0 ? 1 : 0);
   } finally {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    for (const cleanupPath of cleanupPaths) {
+      fs.rmSync(cleanupPath, { recursive: true, force: true });
+    }
   }
 }
 

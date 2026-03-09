@@ -19,6 +19,46 @@ export interface ResolvedTypes {
   version: string;
 }
 
+interface ResolvedGitRef {
+  inputRef: string;
+  gitRef: string;
+  sha: string;
+}
+
+function tryResolveRef(repoPath: string, ref: string): string | null {
+  try {
+    return execSync(`git rev-parse --verify "${ref}^{commit}"`, {
+      cwd: repoPath,
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function resolveGitRef(repoPath: string, inputRef: string): ResolvedGitRef {
+  const candidates = [
+    inputRef,
+    `origin/${inputRef}`,
+    `refs/heads/${inputRef}`,
+    `refs/remotes/origin/${inputRef}`,
+    `refs/tags/${inputRef}`,
+  ];
+
+  for (const candidate of candidates) {
+    const sha = tryResolveRef(repoPath, candidate);
+    if (sha) {
+      return { inputRef, gitRef: candidate, sha };
+    }
+  }
+
+  throw new Error(
+    `Cannot resolve ref "${inputRef}" in ${repoPath}.\n` +
+      `Tried: ${candidates.join(', ')}`
+  );
+}
+
 /**
  * Extract the types file and version from a git ref.
  *
@@ -70,16 +110,12 @@ export function resolveTypesFromRef(
     return { path: outPath, ref, sha, version };
   }
 
-  // Resolve the ref to a SHA
-  const sha = execSync(`git rev-parse "${ref}"`, {
-    cwd: repoPath,
-    encoding: 'utf-8',
-  }).trim();
+  const resolved = resolveGitRef(repoPath, ref);
 
   // Extract the types file content
   let content: string;
   try {
-    content = execSync(`git show "${ref}:${typesFile}"`, {
+    content = execSync(`git show "${resolved.gitRef}:${typesFile}"`, {
       cwd: repoPath,
       encoding: 'utf-8',
       maxBuffer: 50 * 1024 * 1024, // 50MB
@@ -94,7 +130,7 @@ export function resolveTypesFromRef(
   // Extract version from package.json at that ref
   let version = ref;
   try {
-    const pkgJson = execSync(`git show "${ref}:package.json"`, {
+    const pkgJson = execSync(`git show "${resolved.gitRef}:package.json"`, {
       cwd: repoPath,
       encoding: 'utf-8',
     });
@@ -109,5 +145,5 @@ export function resolveTypesFromRef(
   const outPath = path.join(outDir, `types-${safeName}.ts`);
   fs.writeFileSync(outPath, content);
 
-  return { path: outPath, ref, sha, version };
+  return { path: outPath, ref, sha: resolved.sha, version };
 }

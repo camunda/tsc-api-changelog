@@ -64,14 +64,13 @@ The report groups changes by API operation (e.g. `GetDecisionInstance` groups `G
 ## Usage
 
 ```bash
-npx tsx src/cli.ts --repo <path> --old <ref> --new <ref> [options]
+npx tsx src/cli.ts [--repo <path-or-url>] --old <ref> --new <ref> [options]
 ```
 
 ### Required options
 
 | Option | Description |
 |---|---|
-| `--repo <path>` | Path to the git repository |
 | `--old <ref>` | Git ref for the stable/baseline version (tag, branch, SHA) |
 | `--new <ref>` | Git ref for the current version. Use `WORKTREE` to read from the working directory. |
 
@@ -79,6 +78,7 @@ npx tsx src/cli.ts --repo <path> --old <ref> --new <ref> [options]
 
 | Option | Default | Description |
 |---|---|---|
+| `--repo <path-or-url>` | `https://github.com/camunda/orchestration-cluster-api-js` | Local git repo path, or a git URL that will be cloned to a temporary directory |
 | `--types-file <path>` | `src/gen/types.gen.ts` | Path to the types file within the repo |
 | `--output <path>` | stdout | Output file path for the report |
 | `--mode <mode>` | `migration` | `migration` (all changes) or `regression` (disallowed breaking changes only) |
@@ -87,8 +87,14 @@ npx tsx src/cli.ts --repo <path> --old <ref> --new <ref> [options]
 ### Examples
 
 ```bash
-# Compare stable branch to main
+# Compare stable branch to main from the default repo URL
+npx tsx src/cli.ts --old stable/8.8 --new main
+
+# Compare using a local checkout
 npx tsx src/cli.ts --repo ./orchestration-cluster-api-js --old stable/8.8 --new main
+
+# Compare using an explicit remote URL (cloned to a temp directory)
+npx tsx src/cli.ts --repo https://github.com/camunda/orchestration-cluster-api-js --old stable/8.8 --new main
 
 # Compare against working directory (after regenerating from a different spec)
 npx tsx src/cli.ts --repo ./orchestration-cluster-api-js --old stable/8.8 --new WORKTREE \

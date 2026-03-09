@@ -24,28 +24,24 @@ jobs:
       - name: Checkout tsc-api-changelog
         uses: actions/checkout@v4
 
-      - name: Checkout orchestration-cluster-api-js
-        uses: actions/checkout@v4
-        with:
-          repository: camunda/orchestration-cluster-api-js
-          path: orchestration-cluster-api-js
-          fetch-depth: 0
-
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '24'
 
-      - name: Create local stable/8.8 branch
-        working-directory: orchestration-cluster-api-js
-        run: git branch stable/8.8 origin/stable/8.8
+      - name: Clone orchestration-cluster-api-js to temp directory
+        id: sdk
+        run: |
+          SDK_DIR=$(mktemp -d)
+          git clone https://github.com/camunda/orchestration-cluster-api-js "$SDK_DIR"
+          echo "dir=$SDK_DIR" >> "$GITHUB_OUTPUT"
 
       - name: Install SDK dependencies
-        working-directory: orchestration-cluster-api-js
+        working-directory: ${{ steps.sdk.outputs.dir }}
         run: npm ci
 
       - name: Generate SDK from branch
-        working-directory: orchestration-cluster-api-js
+        working-directory: ${{ steps.sdk.outputs.dir }}
         run: SPEC_REF=${{ inputs.camunda_branch }} npm run generate
 
       - name: Install tsc-api-changelog dependencies
@@ -67,9 +63,9 @@ jobs:
       - name: Generate Markdown report
         run: |
           node dist/cli.js \
-            --repo orchestration-cluster-api-js \
             --old stable/8.8 \
             --new WORKTREE \
+            --repo "${{ steps.sdk.outputs.dir }}" \
             --format markdown \
             --output "reports/${{ steps.timestamp.outputs.ts }}_${{ steps.branch.outputs.safe }}.md" \
             || true
@@ -77,12 +73,16 @@ jobs:
       - name: Generate JSON report
         run: |
           node dist/cli.js \
-            --repo orchestration-cluster-api-js \
             --old stable/8.8 \
             --new WORKTREE \
+            --repo "${{ steps.sdk.outputs.dir }}" \
             --format json \
             --output "reports/${{ steps.timestamp.outputs.ts }}_${{ steps.branch.outputs.safe }}.json" \
             || true
+
+      - name: Cleanup temp SDK clone
+        if: always()
+        run: rm -rf "${{ steps.sdk.outputs.dir }}"
 
       - name: Display report in summary
         run: |
