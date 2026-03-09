@@ -154,3 +154,55 @@ export function getPropertyTypes(
 
   return result;
 }
+
+/**
+ * Get top-level property names for exported types.
+ *
+ * Returns a map of type name -> property-name set. Non-object-like exports
+ * return an empty set.
+ */
+export function getExportedTypeProperties(
+  filePath: string,
+  typeNames: Iterable<string>
+): Map<string, Set<string>> {
+  const result = new Map<string, Set<string>>();
+
+  const program = ts.createProgram([filePath], {
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.ES2022,
+    moduleResolution: ts.ModuleResolutionKind.Node10,
+    skipLibCheck: true,
+  });
+
+  const checker = program.getTypeChecker();
+  const sourceFile = program.getSourceFile(filePath);
+  if (!sourceFile) return result;
+
+  const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
+  if (!moduleSymbol) return result;
+
+  const exports = checker.getExportsOfModule(moduleSymbol);
+  const exportMap = new Map<string, ts.Symbol>();
+  for (const exp of exports) {
+    exportMap.set(exp.getName(), exp);
+  }
+
+  for (const typeName of typeNames) {
+    const exp = exportMap.get(typeName);
+    if (!exp) {
+      result.set(typeName, new Set());
+      continue;
+    }
+
+    const resolved =
+      exp.flags & ts.SymbolFlags.Alias
+        ? checker.getAliasedSymbol(exp)
+        : exp;
+
+    const type = checker.getDeclaredTypeOfSymbol(resolved);
+    const props = type.getProperties().map((p) => p.getName());
+    result.set(typeName, new Set(props));
+  }
+
+  return result;
+}

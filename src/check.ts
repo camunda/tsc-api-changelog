@@ -15,7 +15,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { classifyRoleFromMap, type RoleMap } from './roles.js';
-import { getPropertyTypes } from './extract.js';
+import {
+  getExportedTypeProperties,
+  getPropertyTypes,
+} from './extract.js';
 
 export interface CompatError {
   typeName: string;
@@ -182,6 +185,52 @@ export function generateRemovedCheckSource(
 }
 
 /**
+ * Generate an additional breaking pass that checks assignability per shared
+ * top-level property for types already known to be incompatible. This exposes
+ * sibling field incompatibilities that can be hidden by the first failing
+ * property in a whole-type assignment.
+ */
+export function generatePropertyCompatCheckSource(
+  checks: Array<{
+    typeName: string;
+    direction: CompatError['direction'];
+    properties: string[];
+  }>,
+  stableFileName: string,
+  currentFileName: string
+): string {
+  const lines: string[] = [];
+  lines.push('// Auto-generated per-property API compatibility check');
+  lines.push('// Type errors here expose additional property-level breakages.');
+  lines.push('');
+  lines.push(
+    `import type * as Stable from "./${stableFileName.replace(/\.ts$/, '.js')}";`
+  );
+  lines.push(
+    `import type * as Current from "./${currentFileName.replace(/\.ts$/, '.js')}";`
+  );
+  lines.push('');
+
+  for (const check of checks) {
+    const safeType = check.typeName.replace(/[^a-zA-Z0-9_]/g, '_');
+    for (const prop of check.properties) {
+      const safeProp = prop.replace(/[^a-zA-Z0-9_]/g, '_');
+      if (check.direction === 'request' || check.direction === 'forward') {
+        lines.push(
+          `const _${check.direction === 'request' ? 'req' : 'fwd'}_${safeType}__${safeProp}: Current.${check.typeName}["${prop}"] = {} as any as Stable.${check.typeName}["${prop}"];`
+        );
+      } else {
+        lines.push(
+          `const _${check.direction === 'response' ? 'res' : 'rev'}_${safeType}__${safeProp}: Stable.${check.typeName}["${prop}"] = {} as any as Current.${check.typeName}["${prop}"];`
+        );
+      }
+    }
+  }
+
+  return lines.join('\n') + '\n';
+}
+
+/**
  * Run tsc --noEmit in a directory and return raw output.
  */
 function runTsc(dir: string, checkFile = 'compat-check.ts'): string {
@@ -262,7 +311,8 @@ function parseTscOutput(
     );
     if (!varMatch) continue;
 
-    const [, prefix, typeName] = varMatch;
+    const [, prefix, typeAndPropRaw] = varMatch;
+    const [typeName, propFromVar] = typeAndPropRaw.split('__');
 
     let direction: CompatError['direction'];
     if (prefix === 'req') direction = 'request';
@@ -285,6 +335,21 @@ function parseTscOutput(
     }
 
     const message = cleanImportPaths(rawMessage);
+
+    // Property-level check vars encode the property name in the identifier
+    // (e.g. _req_Foo__bar). If tsc doesn't emit a property path line, inject
+    // one so summarization and deduplication remain stable.
+    if (
+      propFromVar &&
+      !details.some((d) =>
+        /Types of property '([^']+)' are incompatible|The types of '([^']+)' are incompatible/.test(d)
+      )
+    ) {
+      details.unshift(
+        `Types of property '${propFromVar}' are incompatible.`
+      );
+    }
+
     errors.push({ typeName, direction, code, message, details });
   }
 
@@ -445,6 +510,56 @@ export function runCompatCheck(
       removedTypes.push(typeName);
     } else {
       incompatibleTypes.push(typeName);
+    }
+  }
+
+  // 1b. Additional breaking-detail pass — per-property checks for
+  // incompatible types to surface sibling property breaks.
+  const stableProps = getExportedTypeProperties(stablePath, incompatibleTypes);
+  const currentProps = getExportedTypeProperties(currentPath, incompatibleTypes);
+
+  const propertyChecks: Array<{
+    typeName: string;
+    direction: CompatError['direction'];
+    properties: string[];
+  }> = [];
+
+  for (const typeName of incompatibleTypes) {
+    const stableSet = stableProps.get(typeName) ?? new Set<string>();
+    const currentSet = currentProps.get(typeName) ?? new Set<string>();
+    const commonProps = [...stableSet].filter((p) => currentSet.has(p)).sort();
+    if (commonProps.length === 0) continue;
+
+    const directions = new Set<CompatError['direction']>(
+      (byType.get(typeName) ?? []).map((e) => e.direction)
+    );
+    for (const direction of directions) {
+      propertyChecks.push({ typeName, direction, properties: commonProps });
+    }
+  }
+
+  if (propertyChecks.length > 0) {
+    const propertyCheckSource = generatePropertyCompatCheckSource(
+      propertyChecks,
+      stableFile,
+      currentFile
+    );
+    const propertyCheckPath = path.join(workDir, 'property-compat-check.ts');
+    fs.writeFileSync(propertyCheckPath, propertyCheckSource);
+    const propertyOutput = runTsc(workDir, 'property-compat-check.ts');
+    const propertyErrors = parseTscOutput(propertyOutput, propertyCheckPath);
+
+    // Merge while avoiding exact duplicate records.
+    const seen = new Set<string>(
+      errors.map(
+        (e) => `${e.typeName}|${e.direction}|${e.code}|${e.message}|${e.details.join('||')}`
+      )
+    );
+    for (const err of propertyErrors) {
+      const key = `${err.typeName}|${err.direction}|${err.code}|${err.message}|${err.details.join('||')}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      errors.push(err);
     }
   }
 

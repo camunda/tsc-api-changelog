@@ -25,7 +25,7 @@ import {
   generateReport,
 } from './report.js';
 import type { ReportMetadata, ReportMode } from './report.js';
-import { buildRoleMap } from './roles.js';
+import { buildRoleMap, buildTypeOperationUsageMap } from './roles.js';
 
 interface CliOptions {
   repoInput: string;
@@ -244,6 +244,7 @@ function main(): void {
     // Build role map from the current types file (structural inference)
     console.error('Building role map from type graph...');
     const roleMap = buildRoleMap(current.path);
+    const operationUsageMap = buildTypeOperationUsageMap(current.path);
     console.error(
       `Role map: ${[...roleMap.values()].filter((r) => r === 'request').length} request, ${[...roleMap.values()].filter((r) => r === 'response').length} response, ${[...roleMap.values()].filter((r) => r === 'unknown').length} ambiguous`
     );
@@ -294,7 +295,8 @@ function main(): void {
             finalResult,
             opts.mode,
             metadata,
-            roleMap
+            roleMap,
+            operationUsageMap
           )
         : generateReport(
             stable.version,
@@ -302,7 +304,8 @@ function main(): void {
             finalResult,
             opts.mode,
             metadata,
-            roleMap
+            roleMap,
+            operationUsageMap
           );
 
     // Output report

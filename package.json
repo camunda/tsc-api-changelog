@@ -21,6 +21,5 @@
   },
   "private": true,
   "dependencies": {
-    "@camunda8/orchestration-cluster-api": "^8.8.4"
   }
 }

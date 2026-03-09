@@ -2,7 +2,12 @@
  * Markdown report generation from compatibility check results.
  */
 
-import { classifyRole, classifyRoleFromMap, type RoleMap } from './roles.js';
+import {
+  classifyRole,
+  classifyRoleFromMap,
+  type RoleMap,
+  type TypeOperationUsageMap,
+} from './roles.js';
 import type { CompatError, CompatResult } from './check.js';
 import { summarizeError } from './summarize.js';
 
@@ -264,6 +269,7 @@ function groupNewTypes(
  */
 function deduplicateItems(items: ChangeItem[]): ChangeItem[] {
   const seen = new Set<string>();
+  const emitted = new Set<string>();
   const result: ChangeItem[] = [];
 
   // First pass: collect canonical (shorter) texts
@@ -292,6 +298,24 @@ function deduplicateItems(items: ChangeItem[]): ChangeItem[] {
       const bareText = bareStatusMatch[2];
       if (seen.has(bareText)) continue; // skip the dup
     }
+
+    // Case 3: request wrapper paths duplicate shorter schema paths.
+    // Examples:
+    //   `.body.tenantId` duplicates `.tenantId`
+    //   `.query.documentId` duplicates `.documentId`
+    //   `.path.processInstanceKey` duplicates `.processInstanceKey`
+    const withoutWrapperPrefix = item.text
+      .replace(/^`\.body\./, '`.')
+      .replace(/^`\.query\./, '`.')
+      .replace(/^`\.path\./, '`.');
+    if (withoutWrapperPrefix !== item.text && seen.has(withoutWrapperPrefix)) {
+      continue;
+    }
+
+    // Exact duplicate line from multiple check passes.
+    if (emitted.has(item.text)) continue;
+    emitted.add(item.text);
+
     result.push(item);
   }
   return result;
@@ -339,12 +363,17 @@ function renderSeveritySection(
   operations: OperationGroup[],
   schemas: SchemaGroup[],
   removedTypes: string[],
-  roleMap: RoleMap = new Map()
+  roleMap: RoleMap = new Map(),
+  operationUsageMap: TypeOperationUsageMap = new Map()
 ): void {
   const entries: SectionEntry[] = [];
   const requestOps = new Set<string>();
   const responseOps = new Set<string>();
   const standaloneSchemas = new Set<string>();
+  const requestSchemas = new Set<string>();
+  const responseSchemas = new Set<string>();
+  const requestOpsViaSchemas = new Set<string>();
+  const responseOpsViaSchemas = new Set<string>();
 
   const matchesSection = (item: ChangeItem): boolean => {
     if (section === 'sdk-impact') {
@@ -418,6 +447,9 @@ function renderSeveritySection(
 
     if (section === 'api-breaking' || section === 'sdk-impact') {
       standaloneSchemas.add(schema.name);
+      const role = classifyRoleFromMap(schema.name, roleMap);
+      if (role === 'request') requestSchemas.add(schema.name);
+      else if (role === 'response') responseSchemas.add(schema.name);
     }
 
     const role = classifyRoleFromMap(schema.name, roleMap);
@@ -453,6 +485,9 @@ function renderSeveritySection(
         }
       } else {
         standaloneSchemas.add(name);
+        const role = classifyRoleFromMap(name, roleMap);
+        if (role === 'request') requestSchemas.add(name);
+        else if (role === 'response') responseSchemas.add(name);
       }
     }
 
@@ -464,6 +499,21 @@ function renderSeveritySection(
   }
 
   if (entries.length === 0) return;
+
+  if (section === 'api-breaking' || section === 'sdk-impact') {
+    for (const schemaName of requestSchemas) {
+      const usage = operationUsageMap.get(schemaName);
+      if (!usage) continue;
+      for (const op of usage.requestOps) requestOpsViaSchemas.add(op);
+      for (const op of usage.responseOps) responseOpsViaSchemas.add(op);
+    }
+    for (const schemaName of responseSchemas) {
+      const usage = operationUsageMap.get(schemaName);
+      if (!usage) continue;
+      for (const op of usage.requestOps) requestOpsViaSchemas.add(op);
+      for (const op of usage.responseOps) responseOpsViaSchemas.add(op);
+    }
+  }
 
   // Operations first, then schemas, each alphabetically
   entries.sort((a, b) => {
@@ -484,21 +534,51 @@ function renderSeveritySection(
     const reqOps = [...requestOps].sort();
     const resOps = [...responseOps].sort();
     const schemasList = [...standaloneSchemas].sort();
+    const reqSchemas = [...requestSchemas].sort();
+    const resSchemas = [...responseSchemas].sort();
 
     const formatList = (items: string[]): string =>
       items.length > 0
         ? items.map((item) => `\`${item}\``).join(', ')
         : 'none';
 
-    lines.push(
-      `**${allOps.length} impacted API operations** (${formatList(allOps)})`
-    );
-    lines.push(
-      `Request operations: ${formatList(reqOps)}`
-    );
-    lines.push(
-      `Response operations: ${formatList(resOps)}`
-    );
+    const pushBulletList = (label: string, items: string[]): void => {
+      lines.push(`**${label}:**`);
+      if (items.length === 0) {
+        lines.push('- none');
+        return;
+      }
+      for (const item of items) {
+        lines.push(`- \`${item}\``);
+      }
+    };
+
+    if (section === 'sdk-impact' || section === 'api-breaking') {
+      lines.push(`**${allOps.length} impacted API operations**`);
+      pushBulletList('Impacted operations', allOps);
+      pushBulletList('Request operations', reqOps);
+      pushBulletList(
+        'Request operations via changed schemas',
+        [...requestOpsViaSchemas].sort()
+      );
+      pushBulletList('Request standalone schemas', reqSchemas);
+      pushBulletList('Response operations', resOps);
+      pushBulletList(
+        'Response operations via changed schemas',
+        [...responseOpsViaSchemas].sort()
+      );
+      pushBulletList('Response standalone schemas', resSchemas);
+    } else {
+      lines.push(
+        `**${allOps.length} impacted API operations** (${formatList(allOps)})`
+      );
+      lines.push(
+        `Request operations: ${formatList(reqOps)}`
+      );
+      lines.push(
+        `Response operations: ${formatList(resOps)}`
+      );
+    }
 
     if (section === 'api-breaking' || section === 'sdk-impact') {
       lines.push(
@@ -519,26 +599,46 @@ interface ChangeCounts {
   apiBreakingOperations: number;
   apiBreakingRequestOperations: number;
   apiBreakingResponseOperations: number;
+  apiBreakingRequestSchemas: number;
+  apiBreakingResponseSchemas: number;
+  apiBreakingRequestOpsViaSchemas: number;
+  apiBreakingResponseOpsViaSchemas: number;
   sdkBreaking: number;
   sdkBreakingRequestOperations: number;
   sdkBreakingResponseOperations: number;
   sdkImpactRequestOperations: number;
   sdkImpactResponseOperations: number;
+  sdkImpactRequestSchemas: number;
+  sdkImpactResponseSchemas: number;
+  sdkImpactRequestOpsViaSchemas: number;
+  sdkImpactResponseOpsViaSchemas: number;
   exhaustivenessRequestOperations: number;
   exhaustivenessResponseOperations: number;
   hardened: number;
 }
 
-function countChanges(result: CompatResult, roleMap: RoleMap = new Map()): ChangeCounts {
+function countChanges(
+  result: CompatResult,
+  roleMap: RoleMap = new Map(),
+  operationUsageMap: TypeOperationUsageMap = new Map()
+): ChangeCounts {
   const apiBreakingTypes = new Set<string>(result.removedTypes);
   const apiBreakingOperations = new Set<string>();
   const apiBreakingRequestOperations = new Set<string>();
   const apiBreakingResponseOperations = new Set<string>();
+  const apiBreakingRequestSchemas = new Set<string>();
+  const apiBreakingResponseSchemas = new Set<string>();
   const sdkBreakingTypes = new Set<string>();
   const sdkBreakingRequestOperations = new Set<string>();
   const sdkBreakingResponseOperations = new Set<string>();
   const sdkImpactRequestOperations = new Set<string>();
   const sdkImpactResponseOperations = new Set<string>();
+  const sdkImpactRequestSchemas = new Set<string>();
+  const sdkImpactResponseSchemas = new Set<string>();
+  const apiBreakingRequestOpsViaSchemas = new Set<string>();
+  const apiBreakingResponseOpsViaSchemas = new Set<string>();
+  const sdkImpactRequestOpsViaSchemas = new Set<string>();
+  const sdkImpactResponseOpsViaSchemas = new Set<string>();
   const exhaustivenessRequestOperations = new Set<string>();
   const exhaustivenessResponseOperations = new Set<string>();
   const hardenedTypes = new Set<string>();
@@ -557,6 +657,29 @@ function countChanges(result: CompatResult, roleMap: RoleMap = new Map()): Chang
     else responseOps.add(opName);
   }
 
+  function trackSchemaImpact(
+    typeName: string,
+    requestSchemas: Set<string>,
+    responseSchemas: Set<string>
+  ): void {
+    if (extractOperation(typeName)) return;
+    const role = classifyRoleFromMap(typeName, roleMap);
+    if (role === 'request') requestSchemas.add(typeName);
+    else if (role === 'response') responseSchemas.add(typeName);
+  }
+
+  function trackTransitiveOpsViaSchema(
+    typeName: string,
+    requestOps: Set<string>,
+    responseOps: Set<string>
+  ): void {
+    if (extractOperation(typeName)) return;
+    const usage = operationUsageMap.get(typeName);
+    if (!usage) return;
+    for (const op of usage.requestOps) requestOps.add(op);
+    for (const op of usage.responseOps) responseOps.add(op);
+  }
+
   for (const removedType of result.removedTypes) {
     trackOperation(
       removedType,
@@ -568,6 +691,26 @@ function countChanges(result: CompatResult, roleMap: RoleMap = new Map()): Chang
       removedType,
       sdkImpactRequestOperations,
       sdkImpactResponseOperations
+    );
+    trackSchemaImpact(
+      removedType,
+      apiBreakingRequestSchemas,
+      apiBreakingResponseSchemas
+    );
+    trackTransitiveOpsViaSchema(
+      removedType,
+      apiBreakingRequestOpsViaSchemas,
+      apiBreakingResponseOpsViaSchemas
+    );
+    trackSchemaImpact(
+      removedType,
+      sdkImpactRequestSchemas,
+      sdkImpactResponseSchemas
+    );
+    trackTransitiveOpsViaSchema(
+      removedType,
+      sdkImpactRequestOpsViaSchemas,
+      sdkImpactResponseOpsViaSchemas
     );
   }
 
@@ -582,10 +725,30 @@ function countChanges(result: CompatResult, roleMap: RoleMap = new Map()): Chang
         apiBreakingResponseOperations,
         apiBreakingOperations
       );
+      trackSchemaImpact(
+        err.typeName,
+        apiBreakingRequestSchemas,
+        apiBreakingResponseSchemas
+      );
+      trackTransitiveOpsViaSchema(
+        err.typeName,
+        apiBreakingRequestOpsViaSchemas,
+        apiBreakingResponseOpsViaSchemas
+      );
       trackOperation(
         err.typeName,
         sdkImpactRequestOperations,
         sdkImpactResponseOperations
+      );
+      trackSchemaImpact(
+        err.typeName,
+        sdkImpactRequestSchemas,
+        sdkImpactResponseSchemas
+      );
+      trackTransitiveOpsViaSchema(
+        err.typeName,
+        sdkImpactRequestOpsViaSchemas,
+        sdkImpactResponseOpsViaSchemas
       );
     }
     else if (cat === 'sdk-breaking') {
@@ -599,6 +762,16 @@ function countChanges(result: CompatResult, roleMap: RoleMap = new Map()): Chang
         err.typeName,
         sdkImpactRequestOperations,
         sdkImpactResponseOperations
+      );
+      trackSchemaImpact(
+        err.typeName,
+        sdkImpactRequestSchemas,
+        sdkImpactResponseSchemas
+      );
+      trackTransitiveOpsViaSchema(
+        err.typeName,
+        sdkImpactRequestOpsViaSchemas,
+        sdkImpactResponseOpsViaSchemas
       );
     }
     else if (cat === 'exhaustiveness') {
@@ -619,10 +792,30 @@ function countChanges(result: CompatResult, roleMap: RoleMap = new Map()): Chang
       apiBreakingResponseOperations,
       apiBreakingOperations
     );
+    trackSchemaImpact(
+      change.typeName,
+      apiBreakingRequestSchemas,
+      apiBreakingResponseSchemas
+    );
+    trackTransitiveOpsViaSchema(
+      change.typeName,
+      apiBreakingRequestOpsViaSchemas,
+      apiBreakingResponseOpsViaSchemas
+    );
     trackOperation(
       change.typeName,
       sdkImpactRequestOperations,
       sdkImpactResponseOperations
+    );
+    trackSchemaImpact(
+      change.typeName,
+      sdkImpactRequestSchemas,
+      sdkImpactResponseSchemas
+    );
+    trackTransitiveOpsViaSchema(
+      change.typeName,
+      sdkImpactRequestOpsViaSchemas,
+      sdkImpactResponseOpsViaSchemas
     );
   }
 
@@ -631,11 +824,19 @@ function countChanges(result: CompatResult, roleMap: RoleMap = new Map()): Chang
     apiBreakingOperations: apiBreakingOperations.size,
     apiBreakingRequestOperations: apiBreakingRequestOperations.size,
     apiBreakingResponseOperations: apiBreakingResponseOperations.size,
+    apiBreakingRequestSchemas: apiBreakingRequestSchemas.size,
+    apiBreakingResponseSchemas: apiBreakingResponseSchemas.size,
+    apiBreakingRequestOpsViaSchemas: apiBreakingRequestOpsViaSchemas.size,
+    apiBreakingResponseOpsViaSchemas: apiBreakingResponseOpsViaSchemas.size,
     sdkBreaking: sdkBreakingTypes.size,
     sdkBreakingRequestOperations: sdkBreakingRequestOperations.size,
     sdkBreakingResponseOperations: sdkBreakingResponseOperations.size,
     sdkImpactRequestOperations: sdkImpactRequestOperations.size,
     sdkImpactResponseOperations: sdkImpactResponseOperations.size,
+    sdkImpactRequestSchemas: sdkImpactRequestSchemas.size,
+    sdkImpactResponseSchemas: sdkImpactResponseSchemas.size,
+    sdkImpactRequestOpsViaSchemas: sdkImpactRequestOpsViaSchemas.size,
+    sdkImpactResponseOpsViaSchemas: sdkImpactResponseOpsViaSchemas.size,
     exhaustivenessRequestOperations: exhaustivenessRequestOperations.size,
     exhaustivenessResponseOperations: exhaustivenessResponseOperations.size,
     hardened: hardenedTypes.size,
@@ -643,7 +844,7 @@ function countChanges(result: CompatResult, roleMap: RoleMap = new Map()): Chang
 }
 
 export function countBreaking(result: CompatResult, roleMap: RoleMap = new Map()): number {
-  const counts = countChanges(result, roleMap);
+  const counts = countChanges(result, roleMap, new Map());
   return counts.apiBreaking + counts.sdkBreaking;
 }
 
@@ -698,7 +899,8 @@ export function generateReport(
   result: CompatResult,
   mode: ReportMode = 'migration',
   metadata?: ReportMetadata,
-  roleMap: RoleMap = new Map()
+  roleMap: RoleMap = new Map(),
+  operationUsageMap: TypeOperationUsageMap = new Map()
 ): string {
   const lines: string[] = [];
 
@@ -738,7 +940,7 @@ export function generateReport(
   const { newOperations, newSchemas } = groupNewTypes(
     result.addedTypes
   );
-  const counts = countChanges(result, roleMap);
+  const counts = countChanges(result, roleMap, operationUsageMap);
 
   // Summary
   lines.push('## Summary');
@@ -759,10 +961,10 @@ export function generateReport(
     `| Removed properties | ${result.removedProperties.length} |`
   );
   lines.push(
-    `| **API breaking changes** | **${counts.apiBreakingRequestOperations} Request Operations / ${counts.apiBreakingResponseOperations} Response Operations** |`
+    `| **API breaking changes** | **Direct: ${counts.apiBreakingRequestOperations} Req Ops / ${counts.apiBreakingResponseOperations} Res Ops; Via Schemas: ${counts.apiBreakingRequestOpsViaSchemas} Req Ops / ${counts.apiBreakingResponseOpsViaSchemas} Res Ops** |`
   );
   lines.push(
-    `| SDK breaking changes | ${counts.sdkImpactRequestOperations} Request Operations / ${counts.sdkImpactResponseOperations} Response Operations |`
+    `| SDK breaking changes | Direct: ${counts.sdkImpactRequestOperations} Req Ops / ${counts.sdkImpactResponseOperations} Res Ops; Via Schemas: ${counts.sdkImpactRequestOpsViaSchemas} Req Ops / ${counts.sdkImpactResponseOpsViaSchemas} Res Ops |`
   );
   lines.push(
     `| Enum extension (exhaustiveness) | ${counts.exhaustivenessRequestOperations} Request Operations / ${counts.exhaustivenessResponseOperations} Response Operations |`
@@ -818,7 +1020,8 @@ export function generateReport(
     changedOps,
     changedSchemas,
     result.removedTypes,
-    roleMap
+    roleMap,
+    operationUsageMap
   );
 
   // SDK Breaking Changes
@@ -829,7 +1032,8 @@ export function generateReport(
     changedOps,
     changedSchemas,
     result.removedTypes,
-    roleMap
+    roleMap,
+    operationUsageMap
   );
 
   // Exhaustiveness
@@ -840,7 +1044,8 @@ export function generateReport(
     changedOps,
     changedSchemas,
     [],
-    roleMap
+    roleMap,
+    operationUsageMap
   );
 
   // Hardened Contract
@@ -851,7 +1056,8 @@ export function generateReport(
     changedOps,
     changedSchemas,
     [],
-    roleMap
+    roleMap,
+    operationUsageMap
   );
 
   // Additive Changes
@@ -862,7 +1068,8 @@ export function generateReport(
     changedOps,
     changedSchemas,
     [],
-    roleMap
+    roleMap,
+    operationUsageMap
   );
 
   // New
@@ -924,9 +1131,10 @@ export function generateJsonReport(
   result: CompatResult,
   mode: ReportMode = 'migration',
   metadata?: ReportMetadata,
-  roleMap: RoleMap = new Map()
+  roleMap: RoleMap = new Map(),
+  operationUsageMap: TypeOperationUsageMap = new Map()
 ): string {
-  const jsonCounts = countChanges(result, roleMap);
+  const jsonCounts = countChanges(result, roleMap, operationUsageMap);
   const changes: Array<{
     category: string;
     changeType: string;

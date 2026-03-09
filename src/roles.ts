@@ -45,6 +45,11 @@ export function classifyRole(name: string): TypeRole {
 // ── Structural role map ────────────────────────────────────────────────
 
 export type RoleMap = Map<string, TypeRole>;
+export interface TypeOperationUsage {
+  requestOps: Set<string>;
+  responseOps: Set<string>;
+}
+export type TypeOperationUsageMap = Map<string, TypeOperationUsage>;
 
 /** Operation-suffix conventions from @hey-api/openapi-ts */
 const OPERATION_REQUEST_SUFFIXES = ['Data'];
@@ -205,4 +210,137 @@ export function buildRoleMap(filePath: string): RoleMap {
  */
 export function classifyRoleFromMap(name: string, roleMap: RoleMap): TypeRole {
   return roleMap.get(name) ?? classifyRole(name);
+}
+
+/**
+ * Build a map of exported type name -> operation names that reach it.
+ *
+ * Request operations are operation `*Data` exports.
+ * Response operations are operation `*Response/*Responses/*Error/*Errors` exports.
+ */
+export function buildTypeOperationUsageMap(filePath: string): TypeOperationUsageMap {
+  const program = ts.createProgram([filePath], {
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.ES2022,
+    moduleResolution: ts.ModuleResolutionKind.Node10,
+    skipLibCheck: true,
+  });
+
+  const checker = program.getTypeChecker();
+  const sourceFile = program.getSourceFile(filePath);
+  if (!sourceFile) return new Map();
+
+  const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
+  if (!moduleSymbol) return new Map();
+
+  const exports = checker.getExportsOfModule(moduleSymbol);
+  const exportMap = new Map<string, ts.Symbol>();
+  for (const exp of exports) {
+    exportMap.set(exp.getName(), exp);
+  }
+
+  const seeds: Array<{ name: string; opName: string; role: 'request' | 'response' }> = [];
+  for (const name of exportMap.keys()) {
+    const req = OPERATION_REQUEST_SUFFIXES.find(
+      (s) => name.endsWith(s) && name.length > s.length
+    );
+    if (req) {
+      seeds.push({
+        name,
+        opName: name.slice(0, -req.length),
+        role: 'request',
+      });
+      continue;
+    }
+
+    const res = OPERATION_RESPONSE_SUFFIXES.find(
+      (s) => name.endsWith(s) && name.length > s.length
+    );
+    if (res) {
+      seeds.push({
+        name,
+        opName: name.slice(0, -res.length),
+        role: 'response',
+      });
+    }
+  }
+
+  const usage: TypeOperationUsageMap = new Map();
+
+  function markUsage(
+    typeName: string,
+    opName: string,
+    role: 'request' | 'response'
+  ): void {
+    if (!usage.has(typeName)) {
+      usage.set(typeName, {
+        requestOps: new Set(),
+        responseOps: new Set(),
+      });
+    }
+    const entry = usage.get(typeName)!;
+    if (role === 'request') entry.requestOps.add(opName);
+    else entry.responseOps.add(opName);
+  }
+
+  function walkType(
+    type: ts.Type,
+    opName: string,
+    role: 'request' | 'response',
+    visited: Set<number>
+  ): void {
+    const typeId = (type as any).id as number | undefined;
+
+    const symbol = type.aliasSymbol ?? type.getSymbol();
+    if (symbol) {
+      const name = symbol.getName();
+      if (exportMap.has(name)) {
+        markUsage(name, opName, role);
+      }
+    }
+
+    if (typeId !== undefined && visited.has(typeId)) return;
+    if (typeId !== undefined) visited.add(typeId);
+
+    if (type.isUnion() || type.isIntersection()) {
+      for (const member of type.types) {
+        walkType(member, opName, role, visited);
+      }
+    }
+
+    for (const prop of type.getProperties()) {
+      const propType = checker.getTypeOfSymbol(prop);
+      walkType(propType, opName, role, visited);
+    }
+
+    const typeArgs = (type as ts.TypeReference).typeArguments;
+    if (typeArgs) {
+      for (const arg of typeArgs) {
+        walkType(arg, opName, role, visited);
+      }
+    }
+
+    const stringIndex = type.getStringIndexType();
+    if (stringIndex) walkType(stringIndex, opName, role, visited);
+    const numberIndex = type.getNumberIndexType();
+    if (numberIndex) walkType(numberIndex, opName, role, visited);
+  }
+
+  for (const seed of seeds) {
+    const sym = exportMap.get(seed.name);
+    if (!sym) continue;
+
+    const resolved =
+      sym.flags & ts.SymbolFlags.Alias
+        ? checker.getAliasedSymbol(sym)
+        : sym;
+    const decls = resolved.getDeclarations();
+    if (!decls || decls.length === 0) continue;
+
+    const type = checker.getDeclaredTypeOfSymbol(resolved);
+    markUsage(seed.name, seed.opName, seed.role);
+    walkType(type, seed.opName, seed.role, new Set());
+  }
+
+  return usage;
 }
