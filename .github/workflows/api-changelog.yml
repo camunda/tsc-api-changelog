@@ -1,4 +1,4 @@
-name: API Changelog
+name: API Changelog from stable/9
 
 on:
   schedule:
@@ -65,7 +65,7 @@ jobs:
       - name: Generate Markdown report
         run: |
           node dist/cli.js \
-            --old stable/8.8 \
+            --old stable/9 \
             --new WORKTREE \
             --repo "${{ steps.sdk.outputs.dir }}" \
             --format markdown \
